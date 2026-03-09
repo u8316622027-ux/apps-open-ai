@@ -38,6 +38,7 @@ MIN_GZIP_BYTES = 512
 TOOL_RESPONSE_CACHE_TTL_SECONDS = 30.0
 TRACKING_RESPONSE_CACHE_TTL_SECONDS = 10.0
 TOOL_RESPONSE_CACHE_MAX_ENTRIES = 256
+MCP_PROTOCOL_VERSION = "2025-06-18"
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 _TOOL_RESPONSE_CACHE_LOCK = threading.Lock()
@@ -804,6 +805,26 @@ def _build_access_log_message(
     )
 
 
+def _client_accepts_sse(accept_header: str | None) -> bool:
+    if accept_header is None:
+        return False
+    return "text/event-stream" in accept_header.lower()
+
+
+def _client_accepts_json(accept_header: str | None) -> bool:
+    if accept_header is None:
+        return True
+    normalized = accept_header.lower()
+    return "application/json" in normalized or "*/*" in normalized
+
+
+def _resolve_mcp_protocol_version(protocol_version_header: str | None) -> str:
+    if protocol_version_header is None:
+        return MCP_PROTOCOL_VERSION
+    normalized = protocol_version_header.strip()
+    return normalized or MCP_PROTOCOL_VERSION
+
+
 class MCPHttpHandler(BaseHTTPRequestHandler):
     """HTTP transport for minimal MCP JSON-RPC methods."""
 
@@ -813,14 +834,46 @@ class MCPHttpHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         started_at = _perf_counter()
         request_id = _resolve_http_request_id(self.headers.get("X-Request-Id"))
+        protocol_version = _resolve_mcp_protocol_version(self.headers.get("MCP-Protocol-Version"))
+        if self.path == "/mcp":
+            if _client_accepts_sse(self.headers.get("Accept")):
+                self._send_sse_comment(
+                    "connected",
+                    request_id=request_id,
+                    protocol_version=protocol_version,
+                )
+                self._log_access(
+                    request_id=request_id, status_code=HTTPStatus.OK, started_at=started_at
+                )
+                return
+            self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
+            self.send_header("Allow", "POST, GET")
+            self.send_header("Content-Length", "0")
+            self.send_header("X-Request-Id", request_id)
+            self.send_header("MCP-Protocol-Version", protocol_version)
+            self.end_headers()
+            self._log_access(
+                request_id=request_id,
+                status_code=HTTPStatus.METHOD_NOT_ALLOWED,
+                started_at=started_at,
+            )
+            return
         if self.path == "/health":
-            self._send_json({"status": "ok"}, request_id=request_id)
+            self._send_json(
+                {"status": "ok"},
+                request_id=request_id,
+                protocol_version=protocol_version,
+            )
             self._log_access(
                 request_id=request_id, status_code=HTTPStatus.OK, started_at=started_at
             )
             return
         if self.path == "/metrics":
-            self._send_json(get_runtime_metrics(), request_id=request_id)
+            self._send_json(
+                get_runtime_metrics(),
+                request_id=request_id,
+                protocol_version=protocol_version,
+            )
             self._log_access(
                 request_id=request_id, status_code=HTTPStatus.OK, started_at=started_at
             )
@@ -831,19 +884,32 @@ class MCPHttpHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         started_at = _perf_counter()
         request_id = _resolve_http_request_id(self.headers.get("X-Request-Id"))
+        protocol_version = _resolve_mcp_protocol_version(self.headers.get("MCP-Protocol-Version"))
         if self.path != "/mcp":
             self.send_error(HTTPStatus.NOT_FOUND)
             self._log_access(
                 request_id=request_id, status_code=HTTPStatus.NOT_FOUND, started_at=started_at
             )
             return
+        accept_header = self.headers.get("Accept")
+        sse_only = _client_accepts_sse(accept_header) and not _client_accepts_json(accept_header)
 
         if not _is_json_content_type(self.headers.get("Content-Type")):
-            self._send_json(
-                _rpc_error(None, -32600, "Invalid Request: Content-Type must be application/json"),
-                status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
-                request_id=request_id,
-            )
+            error_payload = _rpc_error(None, -32600, "Invalid Request: Content-Type must be application/json")
+            if sse_only:
+                self._send_sse_data(
+                    error_payload,
+                    status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                    request_id=request_id,
+                    protocol_version=protocol_version,
+                )
+            else:
+                self._send_json(
+                    error_payload,
+                    status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                    request_id=request_id,
+                    protocol_version=protocol_version,
+                )
             self._log_access(
                 request_id=request_id,
                 status_code=HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
@@ -853,56 +919,108 @@ class MCPHttpHandler(BaseHTTPRequestHandler):
 
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
-            if content_length < 0:
-                self._send_json(
-                    _rpc_error(None, -32600, "Invalid Request: Content-Length must be non-negative"),
+        except ValueError:
+            error_payload = _rpc_error(None, -32600, "Invalid Request: invalid Content-Length header")
+            if sse_only:
+                self._send_sse_data(
+                    error_payload,
                     status=HTTPStatus.BAD_REQUEST,
                     request_id=request_id,
+                    protocol_version=protocol_version,
                 )
-                self._log_access(
-                    request_id=request_id, status_code=HTTPStatus.BAD_REQUEST, started_at=started_at
-                )
-                return
-            if content_length > MAX_REQUEST_BODY_BYTES:
+            else:
                 self._send_json(
-                    _rpc_error(None, -32600, "Invalid Request: body is too large"),
+                    error_payload,
+                    status=HTTPStatus.BAD_REQUEST,
+                    request_id=request_id,
+                    protocol_version=protocol_version,
+                )
+            self._log_access(request_id=request_id, status_code=HTTPStatus.BAD_REQUEST, started_at=started_at)
+            return
+
+        if content_length < 0:
+            error_payload = _rpc_error(None, -32600, "Invalid Request: Content-Length must be non-negative")
+            if sse_only:
+                self._send_sse_data(
+                    error_payload,
+                    status=HTTPStatus.BAD_REQUEST,
+                    request_id=request_id,
+                    protocol_version=protocol_version,
+                )
+            else:
+                self._send_json(
+                    error_payload,
+                    status=HTTPStatus.BAD_REQUEST,
+                    request_id=request_id,
+                    protocol_version=protocol_version,
+                )
+            self._log_access(request_id=request_id, status_code=HTTPStatus.BAD_REQUEST, started_at=started_at)
+            return
+        if content_length > MAX_REQUEST_BODY_BYTES:
+            error_payload = _rpc_error(None, -32600, "Invalid Request: body is too large")
+            if sse_only:
+                self._send_sse_data(
+                    error_payload,
                     status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                     request_id=request_id,
+                    protocol_version=protocol_version,
                 )
-                self._log_access(
+            else:
+                self._send_json(
+                    error_payload,
+                    status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                     request_id=request_id,
-                    status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                    started_at=started_at,
+                    protocol_version=protocol_version,
                 )
-                return
+            self._log_access(
+                request_id=request_id,
+                status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                started_at=started_at,
+            )
+            return
 
-            raw_body = self.rfile.read(content_length)
+        raw_body = self.rfile.read(content_length)
+        try:
             request_payload = json.loads(raw_body.decode("utf-8"))
-            response_payload = handle_jsonrpc_payload(request_payload, http_request_id=request_id)
-            if response_payload is None:
-                self.send_response(HTTPStatus.NO_CONTENT)
-                self.send_header("X-Request-Id", request_id)
-                self.end_headers()
-                self._log_access(
-                    request_id=request_id, status_code=HTTPStatus.NO_CONTENT, started_at=started_at
-                )
-                return
-            self._send_json(response_payload, request_id=request_id)
-            self._log_access(request_id=request_id, status_code=HTTPStatus.OK, started_at=started_at)
-        except ValueError:
-            self._send_json(
-                _rpc_error(None, -32600, "Invalid Request: invalid Content-Length header"),
-                status=HTTPStatus.BAD_REQUEST,
-                request_id=request_id,
-            )
-            self._log_access(request_id=request_id, status_code=HTTPStatus.BAD_REQUEST, started_at=started_at)
         except json.JSONDecodeError:
-            self._send_json(
-                _rpc_error(None, -32700, "Parse error"),
-                status=HTTPStatus.BAD_REQUEST,
-                request_id=request_id,
-            )
+            error_payload = _rpc_error(None, -32700, "Parse error")
+            if sse_only:
+                self._send_sse_data(
+                    error_payload,
+                    status=HTTPStatus.BAD_REQUEST,
+                    request_id=request_id,
+                    protocol_version=protocol_version,
+                )
+            else:
+                self._send_json(
+                    error_payload,
+                    status=HTTPStatus.BAD_REQUEST,
+                    request_id=request_id,
+                    protocol_version=protocol_version,
+                )
             self._log_access(request_id=request_id, status_code=HTTPStatus.BAD_REQUEST, started_at=started_at)
+            return
+
+        response_payload = handle_jsonrpc_payload(request_payload, http_request_id=request_id)
+        if response_payload is None:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("X-Request-Id", request_id)
+            self.send_header("MCP-Protocol-Version", protocol_version)
+            self.end_headers()
+            self._log_access(
+                request_id=request_id, status_code=HTTPStatus.NO_CONTENT, started_at=started_at
+            )
+            return
+        if sse_only:
+            self._send_sse_data(
+                response_payload,
+                request_id=request_id,
+                protocol_version=protocol_version,
+            )
+            self._log_access(request_id=request_id, status_code=HTTPStatus.OK, started_at=started_at)
+            return
+        self._send_json(response_payload, request_id=request_id, protocol_version=protocol_version)
+        self._log_access(request_id=request_id, status_code=HTTPStatus.OK, started_at=started_at)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Keep server output concise in local development.
@@ -914,6 +1032,7 @@ class MCPHttpHandler(BaseHTTPRequestHandler):
         *,
         status: HTTPStatus = HTTPStatus.OK,
         request_id: str | None = None,
+        protocol_version: str = MCP_PROTOCOL_VERSION,
     ) -> None:
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         should_compress = self._should_use_gzip(len(encoded))
@@ -927,6 +1046,7 @@ class MCPHttpHandler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Accept-Encoding")
         if request_id:
             self.send_header("X-Request-Id", request_id)
+        self.send_header("MCP-Protocol-Version", protocol_version)
         self.end_headers()
         self.wfile.write(encoded)
 
@@ -935,6 +1055,46 @@ class MCPHttpHandler(BaseHTTPRequestHandler):
             return False
         accept_encoding = str(self.headers.get("Accept-Encoding") or "").lower()
         return "gzip" in accept_encoding
+
+    def _send_sse_comment(
+        self,
+        comment: str,
+        *,
+        request_id: str | None = None,
+        protocol_version: str = MCP_PROTOCOL_VERSION,
+    ) -> None:
+        payload = f": {comment}\n\n".encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Content-Length", str(len(payload)))
+        if request_id:
+            self.send_header("X-Request-Id", request_id)
+        self.send_header("MCP-Protocol-Version", protocol_version)
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_sse_data(
+        self,
+        payload: dict[str, Any] | list[dict[str, Any]],
+        *,
+        status: HTTPStatus = HTTPStatus.OK,
+        request_id: str | None = None,
+        protocol_version: str = MCP_PROTOCOL_VERSION,
+    ) -> None:
+        data_line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        encoded = f"data: {data_line}\n\n".encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Content-Length", str(len(encoded)))
+        if request_id:
+            self.send_header("X-Request-Id", request_id)
+        self.send_header("MCP-Protocol-Version", protocol_version)
+        self.end_headers()
+        self.wfile.write(encoded)
 
     def _log_access(self, *, request_id: str, status_code: HTTPStatus, started_at: float) -> None:
         latency_ms = (_perf_counter() - started_at) * 1000.0

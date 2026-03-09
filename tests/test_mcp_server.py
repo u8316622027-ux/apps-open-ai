@@ -1184,6 +1184,29 @@ class MCPHttpTransportRequestIdTests(unittest.TestCase):
         connection.close()
         return status_code, headers_map, raw_body
 
+    def _get(self, path: str, headers: dict[str, str] | None = None):
+        connection = http.client.HTTPConnection(self._host, self._port, timeout=5)
+        connection.request("GET", path, headers=headers or {})
+        response = connection.getresponse()
+        raw_body = response.read()
+        headers_map = {key.lower(): value for key, value in response.getheaders()}
+        status_code = response.status
+        connection.close()
+        return status_code, headers_map, raw_body
+
+    def _post_raw(self, body: bytes, headers: dict[str, str] | None = None):
+        request_headers = {"Content-Length": str(len(body))}
+        if headers:
+            request_headers.update(headers)
+        connection = http.client.HTTPConnection(self._host, self._port, timeout=5)
+        connection.request("POST", "/mcp", body=body, headers=request_headers)
+        response = connection.getresponse()
+        raw_body = response.read()
+        headers_map = {key.lower(): value for key, value in response.getheaders()}
+        status_code = response.status
+        connection.close()
+        return status_code, headers_map, raw_body
+
     def test_http_response_includes_incoming_x_request_id(self) -> None:
         status, headers, _ = self._post_mcp(
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
@@ -1191,6 +1214,14 @@ class MCPHttpTransportRequestIdTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(headers.get("x-request-id"), "incoming-req-42")
+
+    def test_http_response_includes_protocol_version_header(self) -> None:
+        status, headers, _ = self._post_mcp(
+            {"jsonrpc": "2.0", "id": 13, "method": "initialize", "params": {}},
+            headers={"MCP-Protocol-Version": "2025-06-18"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("mcp-protocol-version"), "2025-06-18")
 
     def test_http_response_generates_x_request_id_when_missing(self) -> None:
         status, headers, _ = self._post_mcp(
@@ -1235,19 +1266,72 @@ class MCPHttpTransportRequestIdTests(unittest.TestCase):
         self.assertEqual(payload["id"], 4)
 
     def test_http_metrics_endpoint_returns_runtime_snapshot(self) -> None:
-        connection = http.client.HTTPConnection(self._host, self._port, timeout=5)
-        connection.request("GET", "/metrics", headers={})
-        response = connection.getresponse()
-        raw_body = response.read()
-        headers_map = {key.lower(): value for key, value in response.getheaders()}
-        status_code = response.status
-        connection.close()
+        status_code, headers_map, raw_body = self._get("/metrics")
 
         self.assertEqual(status_code, 200)
         self.assertIn("x-request-id", headers_map)
         payload = json.loads(raw_body.decode("utf-8"))
         self.assertIn("rpc_requests_total", payload)
         self.assertIn("tools", payload)
+
+    def test_http_get_mcp_returns_sse_when_requested(self) -> None:
+        status_code, headers_map, raw_body = self._get(
+            "/mcp",
+            headers={"Accept": "text/event-stream"},
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertIn("x-request-id", headers_map)
+        self.assertIn("text/event-stream", headers_map.get("content-type", ""))
+        self.assertIn(": connected", raw_body.decode("utf-8"))
+
+    def test_http_get_mcp_returns_405_when_sse_not_requested(self) -> None:
+        status_code, headers_map, _ = self._get("/mcp", headers={"Accept": "application/json"})
+
+        self.assertEqual(status_code, 405)
+        self.assertIn("x-request-id", headers_map)
+        self.assertEqual(headers_map.get("allow"), "POST, GET")
+
+    def test_http_post_mcp_can_stream_sse_response(self) -> None:
+        status_code, headers_map, raw_body = self._post_mcp(
+            {"jsonrpc": "2.0", "id": 11, "method": "initialize", "params": {}},
+            headers={"Accept": "text/event-stream"},
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertIn("x-request-id", headers_map)
+        self.assertIn("text/event-stream", headers_map.get("content-type", ""))
+        body_text = raw_body.decode("utf-8")
+        self.assertIn("data: ", body_text)
+        payload = json.loads(body_text.removeprefix("data: ").strip())
+        self.assertEqual(payload["id"], 11)
+        self.assertIn("result", payload)
+
+    def test_http_post_mcp_prefers_json_when_accept_allows_json(self) -> None:
+        status_code, headers_map, raw_body = self._post_mcp(
+            {"jsonrpc": "2.0", "id": 12, "method": "initialize", "params": {}},
+            headers={"Accept": "text/event-stream, application/json"},
+        )
+
+        self.assertEqual(status_code, 200)
+        self.assertIn("x-request-id", headers_map)
+        self.assertIn("application/json", headers_map.get("content-type", ""))
+        payload = json.loads(raw_body.decode("utf-8"))
+        self.assertEqual(payload["id"], 12)
+        self.assertIn("result", payload)
+
+    def test_http_post_mcp_returns_sse_error_when_sse_only_requested(self) -> None:
+        status_code, headers_map, raw_body = self._post_raw(
+            b'{"jsonrpc":"2.0","id":14,"method":"initialize","params":{}}',
+            headers={"Accept": "text/event-stream"},
+        )
+
+        self.assertEqual(status_code, 415)
+        self.assertIn("text/event-stream", headers_map.get("content-type", ""))
+        body_text = raw_body.decode("utf-8")
+        self.assertIn("data: ", body_text)
+        payload = json.loads(body_text.removeprefix("data: ").strip())
+        self.assertEqual(payload["error"]["code"], -32600)
 
     def test_http_request_writes_access_log_with_request_details(self) -> None:
         with patch("app.interfaces.mcp.server.logger") as mocked_logger:

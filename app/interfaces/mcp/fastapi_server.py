@@ -10,9 +10,13 @@ import json
 from typing import Any
 
 from app.interfaces.mcp.server import (
+    MCP_PROTOCOL_VERSION,
     MAX_REQUEST_BODY_BYTES,
     MIN_GZIP_BYTES,
+    _client_accepts_json,
+    _client_accepts_sse,
     _is_json_content_type,
+    _resolve_mcp_protocol_version,
     _resolve_http_request_id,
     _rpc_error,
     get_runtime_metrics,
@@ -37,6 +41,11 @@ def _build_json_response_bytes(
 
     compressed = gzip.compress(encoded, compresslevel=5)
     return compressed, {"Content-Encoding": "gzip", "Vary": "Accept-Encoding"}
+
+
+def _build_sse_data_bytes(payload: dict[str, Any] | list[dict[str, Any]]) -> bytes:
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"data: {encoded}\n\n".encode("utf-8")
 
 
 async def _dispatch_jsonrpc_in_thread(
@@ -69,39 +78,110 @@ def create_fastapi_app(*, registry: dict[str, Any] | None = None) -> Any:
     @app.get("/health")
     async def health(request: Any) -> Any:
         request_id = _resolve_http_request_id(request.headers.get("x-request-id"))
-        return JSONResponse({"status": "ok"}, headers={"X-Request-Id": request_id})
+        protocol_version = _resolve_mcp_protocol_version(request.headers.get("mcp-protocol-version"))
+        return JSONResponse(
+            {"status": "ok"},
+            headers={"X-Request-Id": request_id, "MCP-Protocol-Version": protocol_version},
+        )
 
     @app.get("/metrics")
     async def metrics(request: Any) -> Any:
         request_id = _resolve_http_request_id(request.headers.get("x-request-id"))
-        return JSONResponse(get_runtime_metrics(), headers={"X-Request-Id": request_id})
+        protocol_version = _resolve_mcp_protocol_version(request.headers.get("mcp-protocol-version"))
+        return JSONResponse(
+            get_runtime_metrics(),
+            headers={"X-Request-Id": request_id, "MCP-Protocol-Version": protocol_version},
+        )
+
+    @app.get("/mcp")
+    async def mcp_transport(request: Any) -> Any:
+        request_id = _resolve_http_request_id(request.headers.get("x-request-id"))
+        protocol_version = _resolve_mcp_protocol_version(request.headers.get("mcp-protocol-version"))
+        if not _client_accepts_sse(request.headers.get("accept")):
+            return Response(
+                status_code=405,
+                headers={
+                    "Allow": "POST, GET",
+                    "X-Request-Id": request_id,
+                    "MCP-Protocol-Version": protocol_version,
+                },
+            )
+        return Response(
+            content=b": connected\n\n",
+            status_code=200,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Request-Id": request_id,
+                "MCP-Protocol-Version": protocol_version,
+            },
+        )
 
     @app.post("/mcp")
     async def mcp_rpc(request: Any) -> Any:
         request_id = _resolve_http_request_id(request.headers.get("x-request-id"))
+        protocol_version = _resolve_mcp_protocol_version(request.headers.get("mcp-protocol-version"))
+        accept_header = request.headers.get("accept")
+        sse_only = _client_accepts_sse(accept_header) and not _client_accepts_json(accept_header)
         content_type = request.headers.get("content-type")
         if not _is_json_content_type(content_type):
+            error_payload = _rpc_error(None, -32600, "Invalid Request: Content-Type must be application/json")
+            if sse_only:
+                return Response(
+                    content=_build_sse_data_bytes(error_payload),
+                    status_code=415,
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Request-Id": request_id,
+                        "MCP-Protocol-Version": protocol_version,
+                    },
+                )
             return JSONResponse(
-                _rpc_error(None, -32600, "Invalid Request: Content-Type must be application/json"),
+                error_payload,
                 status_code=415,
-                headers={"X-Request-Id": request_id},
+                headers={"X-Request-Id": request_id, "MCP-Protocol-Version": protocol_version},
             )
 
         raw_body = await request.body()
         if len(raw_body) > MAX_REQUEST_BODY_BYTES:
+            error_payload = _rpc_error(None, -32600, "Invalid Request: body is too large")
+            if sse_only:
+                return Response(
+                    content=_build_sse_data_bytes(error_payload),
+                    status_code=413,
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Request-Id": request_id,
+                        "MCP-Protocol-Version": protocol_version,
+                    },
+                )
             return JSONResponse(
-                _rpc_error(None, -32600, "Invalid Request: body is too large"),
+                error_payload,
                 status_code=413,
-                headers={"X-Request-Id": request_id},
+                headers={"X-Request-Id": request_id, "MCP-Protocol-Version": protocol_version},
             )
 
         try:
             request_payload = json.loads(raw_body.decode("utf-8"))
         except json.JSONDecodeError:
+            error_payload = _rpc_error(None, -32700, "Parse error")
+            if sse_only:
+                return Response(
+                    content=_build_sse_data_bytes(error_payload),
+                    status_code=400,
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "X-Request-Id": request_id,
+                        "MCP-Protocol-Version": protocol_version,
+                    },
+                )
             return JSONResponse(
-                _rpc_error(None, -32700, "Parse error"),
+                error_payload,
                 status_code=400,
-                headers={"X-Request-Id": request_id},
+                headers={"X-Request-Id": request_id, "MCP-Protocol-Version": protocol_version},
             )
 
         response_payload = await _dispatch_jsonrpc_in_thread(
@@ -110,13 +190,28 @@ def create_fastapi_app(*, registry: dict[str, Any] | None = None) -> Any:
             request_id=request_id,
         )
         if response_payload is None:
-            return Response(status_code=204, headers={"X-Request-Id": request_id})
+            return Response(
+                status_code=204,
+                headers={"X-Request-Id": request_id, "MCP-Protocol-Version": protocol_version},
+            )
+
+        if sse_only:
+            return Response(
+                content=_build_sse_data_bytes(response_payload),
+                status_code=200,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Request-Id": request_id,
+                    "MCP-Protocol-Version": protocol_version,
+                },
+            )
 
         response_bytes, encoding_headers = _build_json_response_bytes(
             response_payload,
             accept_encoding=request.headers.get("accept-encoding"),
         )
-        headers = {"X-Request-Id": request_id}
+        headers = {"X-Request-Id": request_id, "MCP-Protocol-Version": protocol_version}
         headers.update(encoding_headers)
         return Response(
             content=response_bytes,

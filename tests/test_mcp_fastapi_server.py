@@ -60,14 +60,20 @@ class MCPFastAPIServerTests(unittest.TestCase):
         class FakeApp:
             def __init__(self) -> None:
                 self.mounted: list[tuple[str, object, str]] = []
+                self.get_routes: list[str] = []
+                self.post_routes: list[str] = []
 
             def get(self, _path: str):
+                self.get_routes.append(_path)
+
                 def _decorator(func):
                     return func
 
                 return _decorator
 
             def post(self, _path: str):
+                self.post_routes.append(_path)
+
                 def _decorator(func):
                     return func
 
@@ -88,6 +94,8 @@ class MCPFastAPIServerTests(unittest.TestCase):
 
         self.assertIs(app, fake_app)
         self.assertFalse(fake_app.mounted)
+        self.assertIn("/mcp", fake_app.get_routes)
+        self.assertIn("/mcp", fake_app.post_routes)
 
 
 if __name__ == "__main__":
